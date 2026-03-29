@@ -87,7 +87,8 @@ async def create_account(
     payload = {
         "user_id": user_id,
         "nickname": nickname,
-        "password": hashed_password
+        "password": hashed_password,
+        "profile_bio": profile_text
     }
     
     try:
