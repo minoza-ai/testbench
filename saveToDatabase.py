@@ -41,7 +41,8 @@ class DatabaseSaver:
         self.mongodb_uri = mongodb_uri
         self.client = None
         self.db = None
-        self.collection = None
+        self.users_collection = None
+        self.teaming_collection = None
         self.hashed_password = None  # 미리 계산한 해싱 비밀번호
     
     def hash_password(self):
@@ -60,8 +61,9 @@ class DatabaseSaver:
             # 연결 확인
             self.client.admin.command('ping')
             self.db = self.client[DATABASE_NAME]
-            self.collection = self.db[COLLECTION_NAME]
-            logger.info(f"MongoDB 연결 성공: {DATABASE_NAME}/{COLLECTION_NAME}")
+            self.users_collection = self.db["users"]
+            self.teaming_collection = self.db["teaming"]
+            logger.info(f"MongoDB 연결 성공: {DATABASE_NAME} - users, teaming 컬렉션")
             return True
         except (ServerSelectionTimeoutError, Exception) as e:
             logger.error(f"MongoDB 연결 실패: {e}")
@@ -121,9 +123,9 @@ class DatabaseSaver:
             return None
     
     def save_accounts(self, accounts: List[Dict]) -> int:
-        """계정 정보를 MongoDB에 저장합니다"""
-        if self.collection is None:
-            logger.error("MongoDB 컬렉션이 연결되지 않았습니다")
+        """사용자 정보를 users 컬렉션에 저장합니다"""
+        if self.users_collection is None:
+            logger.error("MongoDB users 컬렉션이 연결되지 않았습니다")
             return 0
         
         # 올바른 형식으로 변환
@@ -139,37 +141,95 @@ class DatabaseSaver:
         
         try:
             # 기존 데이터 삭제
-            delete_result = self.collection.delete_many({})
-            logger.info(f"기존 {delete_result.deleted_count}개 레코드를 삭제했습니다")
+            delete_result = self.users_collection.delete_many({})
+            logger.info(f"기존 {delete_result.deleted_count}개 users 레코드를 삭제했습니다")
             
             # 새 데이터 삽입
-            insert_result = self.collection.insert_many(cleaned_accounts)
-            logger.info(f"✓ {len(insert_result.inserted_ids)}개의 사용자 데이터가 MongoDB에 저장되었습니다")
+            insert_result = self.users_collection.insert_many(cleaned_accounts)
+            logger.info(f"✓ {len(insert_result.inserted_ids)}개의 사용자 데이터가 users 컬렉션에 저장되었습니다")
             
             return len(insert_result.inserted_ids)
         except Exception as e:
-            logger.error(f"데이터 저장 중 오류 발생: {e}")
+            logger.error(f"users 컬렉션 저장 중 오류 발생: {e}")
+            return 0
+    
+    def build_account_metadata(self, account: Dict) -> Dict:
+        """계정 정보를 teaming 컬렉션 형식으로 변환합니다"""
+        try:
+            account_data = {
+                "user_uuid": account.get("uuid", str(uuid4())),
+                "type": "human",
+                "elo": 1000,
+                "availability": True,
+                "cost": 0
+            }
+            return account_data
+        except Exception as e:
+            logger.error(f"계정 메타데이터 변환 오류: {e}")
+            return None
+    
+    def save_account_metadata(self, accounts: List[Dict]) -> int:
+        """팀 매칭 정보를 teaming 컬렉션에 저장합니다"""
+        if self.teaming_collection is None:
+            logger.error("MongoDB teaming 컬렉션이 연결되지 않았습니다")
+            return 0
+        
+        # accounts 형식으로 변환
+        account_metadata = []
+        for acc in accounts:
+            metadata = self.build_account_metadata(acc)
+            if metadata is not None:
+                account_metadata.append(metadata)
+        
+        if not account_metadata:
+            logger.error("변환된 계정 메타데이터가 없습니다")
+            return 0
+        
+        try:
+            # 기존 데이터 삭제
+            delete_result = self.teaming_collection.delete_many({})
+            logger.info(f"기존 {delete_result.deleted_count}개 teaming 레코드를 삭제했습니다")
+            
+            # 새 데이터 삽입
+            insert_result = self.teaming_collection.insert_many(account_metadata)
+            logger.info(f"✓ {len(insert_result.inserted_ids)}개의 계정 메타데이터가 teaming 컬렉션에 저장되었습니다")
+            
+            return len(insert_result.inserted_ids)
+        except Exception as e:
+            logger.error(f"teaming 컬렉션 저장 중 오류 발생: {e}")
             return 0
     
     def verify_save(self) -> bool:
         """저장된 데이터를 검증합니다"""
         try:
-            count = self.collection.count_documents({})
-            logger.info(f"MongoDB에 저장된 사용자 수: {count}")
+            users_count = self.users_collection.count_documents({})
+            teaming_count = self.teaming_collection.count_documents({})
+            logger.info(f"✓ users 컬렉션: {users_count}개 / teaming 컬렉션: {teaming_count}개")
             
-            # 샘플 데이터 확인
-            sample = self.collection.find_one()
-            if sample:
-                sample_info = {
-                    "user_uuid": sample.get("user_uuid"),
-                    "user_id": sample.get("user_id"),
-                    "nickname": sample.get("nickname"),
-                    "profile_bio": sample.get("profile_bio", "")[:50],  # 처음 50자
-                    "created_at": sample.get("created_at")
+            # users 샘플 데이터 확인
+            users_sample = self.users_collection.find_one()
+            if users_sample:
+                users_info = {
+                    "user_uuid": users_sample.get("user_uuid"),
+                    "user_id": users_sample.get("user_id"),
+                    "nickname": users_sample.get("nickname"),
+                    "profile_bio": users_sample.get("profile_bio", "")[:50]
                 }
-                logger.info(f"샘플 데이터: {json.dumps(sample_info, ensure_ascii=False)}")
-                return True
-            return False
+                logger.info(f"users 샘플: {json.dumps(users_info, ensure_ascii=False)}")
+            
+            # teaming 샘플 데이터 확인
+            teaming_sample = self.teaming_collection.find_one()
+            if teaming_sample:
+                teaming_info = {
+                    "user_uuid": teaming_sample.get("user_uuid"),
+                    "type": teaming_sample.get("type"),
+                    "elo": teaming_sample.get("elo"),
+                    "availability": teaming_sample.get("availability"),
+                    "cost": teaming_sample.get("cost")
+                }
+                logger.info(f"teaming 샘플: {json.dumps(teaming_info, ensure_ascii=False)}")
+            
+            return users_count > 0 and teaming_count > 0
         except Exception as e:
             logger.error(f"데이터 검증 중 오류: {e}")
             return False
@@ -178,7 +238,7 @@ class DatabaseSaver:
 def main():
     """메인 함수"""
     logger.info("=" * 60)
-    logger.info("사용자 데이터 MongoDB 저장 시작")
+    logger.info("사용자 데이터 MongoDB 저장 시작 (users, teaming 컬렉션)")
     logger.info("=" * 60)
     
     saver = DatabaseSaver(MONGODB_URI)
@@ -199,14 +259,21 @@ def main():
         saver.disconnect()
         return
     
-    # 계정 정보 저장
+    # users 컬렉션에 사용자 정보 저장
+    logger.info("\n[1/2] users 컬렉션에 사용자 정보 저장 중...")
     saved_count = saver.save_accounts(accounts)
     
+    # teaming 컬렉션에 팀 매칭 정보 저장
+    logger.info("[2/2] teaming 컬렉션에 팀 매칭 정보 저장 중...")
+    metadata_count = saver.save_account_metadata(accounts)
+    
     # 데이터 검증
-    if saved_count > 0:
+    if saved_count > 0 and metadata_count > 0:
+        logger.info("\n데이터 검증 중...")
         saver.verify_save()
     
     saver.disconnect()
+    
     
     logger.info("=" * 60)
     logger.info("프로세스 완료")
