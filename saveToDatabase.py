@@ -2,6 +2,9 @@ import json
 import logging
 import re
 from typing import List, Dict
+import hashlib
+import hmac
+import requests
 from pymongo import MongoClient
 from pymongo.errors import ServerSelectionTimeoutError
 from dotenv import load_dotenv
@@ -30,6 +33,10 @@ DATABASE_NAME = "taskrit"
 COLLECTION_NAME = "users"
 CHATTING_DATABASE_NAME = "taskrit-chatting"
 CHATTING_COLLECTION_NAME = "users"
+TEAMING_API_BASE = os.getenv("TEAMING_API_BASE", "http://localhost:3002").rstrip("/")
+TEAMING_HMAC_KEY = os.getenv("HMAC_KEY", "").strip()
+TEAMING_REQUEST_TIMEOUT = int(os.getenv("TEAMING_REQUEST_TIMEOUT", "10"))
+TEAMING_SKIP_AI = os.getenv("TEAMING_SKIP_AI", "true").lower() == "true"
 TEST_USER_ID_REGEX = r"^test_user_\d+$"
 TEST_NICKNAME_REGEX = r"^TestUser\d+$"
 
@@ -50,6 +57,11 @@ class DatabaseSaver:
         self.users_collection = None
         self.teaming_collection = None
         self.chatting_user_collection = None
+        self.teaming_api_base = TEAMING_API_BASE
+        self.teaming_hmac_key = TEAMING_HMAC_KEY
+        self.teaming_timeout = TEAMING_REQUEST_TIMEOUT
+        self.teaming_skip_ai = TEAMING_SKIP_AI
+        self.http_session = requests.Session()
         self.hashed_password = None  # 미리 계산한 해싱 비밀번호
     
     def hash_password(self):
@@ -83,9 +95,102 @@ class DatabaseSaver:
     
     def disconnect(self):
         """MongoDB 연결을 종료합니다"""
+        self.http_session.close()
         if self.client is not None:
             self.client.close()
             logger.info("MongoDB 연결 종료")
+
+    def generate_hmac(self, account_id: str) -> str:
+        """teaming API 요청용 HMAC 서명을 생성합니다"""
+        # 개발 환경에서는 HMAC_KEY가 비어 있을 수 있다.
+        # 이 경우 빈 키로 서명하고, 서버 키와 불일치하면 API에서 403을 반환한다.
+        key = self.teaming_hmac_key or ""
+        return hmac.new(
+            key.encode('utf-8'),
+            account_id.encode('utf-8'),
+            hashlib.sha256,
+        ).hexdigest()
+
+    @staticmethod
+    def _response_detail(response) -> str:
+        """HTTP 응답에서 에러 상세를 추출합니다"""
+        try:
+            payload = response.json()
+            return payload.get("detail") or payload.get("error") or response.text
+        except Exception:
+            return response.text
+
+    def _build_teaming_payload(self, account: Dict) -> Dict:
+        """teaming API 요청 payload를 생성합니다"""
+        ability_text = (account.get("profile") or "").strip()
+        if not ability_text:
+            fallback_name = (account.get("nickname") or account.get("user_id") or "테스트 계정").strip()
+            ability_text = f"{fallback_name} 프로필"
+
+        return {
+            "userId": account.get("user_id"),
+            "nickname": account.get("nickname"),
+            "abilityText": ability_text,
+            "cost": 0,
+            "skipAi": self.teaming_skip_ai,
+        }
+
+    def _delete_teaming_account_via_api(self, account_id: str) -> bool:
+        """teaming API를 통해 계정을 삭제합니다(없으면 성공으로 간주)."""
+        signature = self.generate_hmac(account_id)
+        delete_url = f"{self.teaming_api_base}/Account/{account_id}"
+
+        try:
+            response = self.http_session.delete(
+                delete_url,
+                params={"hmac": signature},
+                timeout=self.teaming_timeout,
+            )
+        except requests.RequestException as e:
+            logger.error(f"teaming API 삭제 요청 실패({account_id}): {e}")
+            return False
+
+        if response.status_code in (200, 204, 404):
+            return True
+
+        logger.error(
+            f"teaming API 삭제 실패({account_id}): "
+            f"status={response.status_code}, detail={self._response_detail(response)}"
+        )
+        return False
+
+    def _create_teaming_account_via_api(self, account: Dict) -> bool:
+        """teaming API를 통해 계정을 생성합니다"""
+        account_id = account.get("uuid", str(uuid4()))
+        signature = self.generate_hmac(account_id)
+
+        create_payload = {
+            "accountId": account_id,
+            "type": "human",
+            **self._build_teaming_payload(account),
+            "hmac": signature,
+        }
+
+        create_url = f"{self.teaming_api_base}/Account"
+
+        try:
+            response = self.http_session.post(
+                create_url,
+                json=create_payload,
+                timeout=self.teaming_timeout,
+            )
+        except requests.RequestException as e:
+            logger.error(f"teaming API 생성 요청 실패({account_id}): {e}")
+            return False
+
+        if response.status_code in (200, 201):
+            return True
+
+        logger.error(
+            f"teaming API 생성 실패({account_id}): "
+            f"status={response.status_code}, detail={self._response_detail(response)}"
+        )
+        return False
     
     def load_accounts(self) -> List[Dict]:
         """JSON 파일에서 계정 정보를 로드합니다"""
@@ -198,61 +303,39 @@ class DatabaseSaver:
             logger.error(f"users 컬렉션 저장 중 오류 발생: {e}")
             return 0
     
-    def build_account_metadata(self, account: Dict) -> Dict:
-        """계정 정보를 teaming 컬렉션 형식으로 변환합니다"""
-        try:
-            account_data = {
-                "user_uuid": account.get("uuid", str(uuid4())),
-                "type": "human",
-                "elo": 1000,
-                "availability": True,
-                "cost": 0
-            }
-            return account_data
-        except Exception as e:
-            logger.error(f"계정 메타데이터 변환 오류: {e}")
-            return None
-    
     def save_account_metadata(self, accounts: List[Dict]) -> int:
-        """팀 매칭 정보를 teaming 컬렉션에 저장합니다"""
-        if self.teaming_collection is None:
-            logger.error("MongoDB teaming 컬렉션이 연결되지 않았습니다")
-            return 0
+        """팀 매칭 정보를 teaming API 경유로 저장합니다"""
+        if not self.teaming_hmac_key:
+            logger.warning(
+                "HMAC_KEY가 설정되지 않아 빈 키로 서명합니다. "
+                "서버 HMAC_KEY와 다르면 403이 발생할 수 있습니다."
+            )
 
         test_accounts = [acc for acc in accounts if self.is_generated_test_account(acc)]
         if not test_accounts:
             logger.error("생성 규칙(TestUser/test_user_)에 맞는 테스트 계정이 없습니다")
             return 0
-        
-        # accounts 형식으로 변환
-        account_metadata = []
+
+        # 기존 테스트 계정은 API로 삭제 후 재생성하여 벡터/구성요소까지 재빌드한다.
+        deleted_count = 0
+        created_count = 0
+
         for acc in test_accounts:
-            metadata = self.build_account_metadata(acc)
-            if metadata is not None:
-                account_metadata.append(metadata)
-        
-        if not account_metadata:
-            logger.error("변환된 계정 메타데이터가 없습니다")
-            return 0
-        
-        try:
-            # 이번 파일로 생성된 테스트 계정 UUID에 해당하는 데이터만 삭제
-            test_uuids = self.get_generated_test_uuids(test_accounts)
-            delete_result = self.teaming_collection.delete_many({
-                "user_uuid": {"$in": test_uuids}
-            })
-            logger.info(
-                f"기존 테스트 teaming 레코드 {delete_result.deleted_count}개를 삭제했습니다"
-            )
-            
-            # 새 데이터 삽입
-            insert_result = self.teaming_collection.insert_many(account_metadata)
-            logger.info(f"✓ {len(insert_result.inserted_ids)}개의 계정 메타데이터가 teaming 컬렉션에 저장되었습니다")
-            
-            return len(insert_result.inserted_ids)
-        except Exception as e:
-            logger.error(f"teaming 컬렉션 저장 중 오류 발생: {e}")
-            return 0
+            account_id = acc.get("uuid")
+            if not account_id:
+                logger.warning(f"uuid가 없는 계정은 건너뜁니다: user_id={acc.get('user_id')}")
+                continue
+
+            if self._delete_teaming_account_via_api(account_id):
+                deleted_count += 1
+
+            if self._create_teaming_account_via_api(acc):
+                created_count += 1
+
+        logger.info(
+            f"teaming API 처리 완료: 삭제 시도 성공 {deleted_count}건, 생성 성공 {created_count}건"
+        )
+        return created_count
 
     def build_chatting_user_data(self, account: Dict) -> Dict:
         """계정 정보를 taskrit-chatting.users 컬렉션 형식으로 변환합니다"""
@@ -393,8 +476,8 @@ def main():
     logger.info("\n[1/3] users 컬렉션에 사용자 정보 저장 중...")
     saved_count = saver.save_accounts(accounts)
     
-    # teaming 컬렉션에 팀 매칭 정보 저장
-    logger.info("[2/3] teaming 컬렉션에 팀 매칭 정보 저장 중...")
+    # teaming API를 거쳐 팀 매칭 정보 저장
+    logger.info("[2/3] teaming API를 통해 팀 매칭 정보 저장 중...")
     metadata_count = saver.save_account_metadata(accounts)
 
     # taskrit-chatting.users 컬렉션에 사용자 정보 저장
